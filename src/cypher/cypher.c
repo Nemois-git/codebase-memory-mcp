@@ -2038,6 +2038,306 @@ typedef struct {
     cbm_store_t *store; /* for computing in_degree/out_degree on demand */
 } binding_t;
 
+static void binding_free(binding_t *b); /* Forward declaration */
+static void binding_set(binding_t *b, const char *var, const cbm_node_t *node);
+static cbm_node_t *binding_get(binding_t *b, const char *var);
+static void binding_copy(binding_t *dst, const binding_t *src);
+
+/* ── Volcano Iterator Core (Streaming Execution) ─────────────────── */
+
+typedef struct cbm_iterator_s cbm_iterator_t;
+
+typedef struct {
+    /* next() produces the next binding_t row. Returns false on EOF or error. */
+    bool (*next)(cbm_iterator_t *self, binding_t *out_b);
+    /* free() cleans up the iterator state and its child. */
+    void (*free)(cbm_iterator_t *self);
+    /* get_error() returns error message if any, or NULL. */
+    const char *(*get_error)(cbm_iterator_t *self);
+} cbm_iterator_vtable_t;
+
+struct cbm_iterator_s {
+    const cbm_iterator_vtable_t *vtable;
+    cbm_iterator_t *child;
+    void *state;
+};
+
+/* Limit Iterator */
+typedef struct {
+    int skip;
+    int limit;
+    int produced;
+    int skipped;
+} iter_limit_state_t;
+
+static bool iter_limit_next(cbm_iterator_t *self, binding_t *out_b) {
+    iter_limit_state_t *st = self->state;
+    if (st->limit > 0 && st->produced >= st->limit) {
+        return false; /* Short-circuit: LIMIT reached */
+    }
+    while (st->skipped < st->skip) {
+        binding_t b = {0};
+        if (!self->child->vtable->next(self->child, &b)) {
+            return false; /* EOF during SKIP */
+        }
+        binding_free(&b);
+        st->skipped++;
+    }
+    if (self->child->vtable->next(self->child, out_b)) {
+        st->produced++;
+        return true;
+    }
+    return false;
+}
+
+static void iter_limit_free(cbm_iterator_t *self) {
+    if (self->child) {
+        self->child->vtable->free(self->child);
+    }
+    free(self->state);
+    free(self);
+}
+
+static const char *iter_default_get_error(cbm_iterator_t *self) {
+    if (self->child && self->child->vtable->get_error) {
+        return self->child->vtable->get_error(self->child);
+    }
+    return NULL;
+}
+
+static cbm_iterator_t *iter_limit_new(cbm_iterator_t *child, int skip, int limit) {
+    cbm_iterator_t *iter = calloc(1, sizeof(cbm_iterator_t));
+    static const cbm_iterator_vtable_t vt = { .next = iter_limit_next, .free = iter_limit_free, .get_error = iter_default_get_error };
+    iter->vtable = &vt;
+    iter->child = child;
+    iter_limit_state_t *st = calloc(1, sizeof(iter_limit_state_t));
+    st->skip = skip;
+    st->limit = limit;
+    iter->state = st;
+    return iter;
+}
+
+/* Scan Iterator (Wraps existing eager scan for incremental yielding) */
+typedef struct {
+    cbm_node_t *nodes;
+    int total;
+    int current;
+    const char *var_name;
+    cbm_store_t *store;
+} iter_scan_state_t;
+
+static bool iter_scan_next(cbm_iterator_t *self, binding_t *out_b) {
+    iter_scan_state_t *st = self->state;
+    if (st->current >= st->total) {
+        return false;
+    }
+    memset(out_b, 0, sizeof(*out_b));
+    out_b->store = st->store;
+    binding_set(out_b, st->var_name, &st->nodes[st->current]);
+    st->current++;
+    return true;
+}
+
+static void iter_scan_free(cbm_iterator_t *self) {
+    iter_scan_state_t *st = self->state;
+    cbm_store_free_nodes(st->nodes, st->total);
+    free(st);
+    free(self);
+}
+
+static cbm_iterator_t *iter_scan_new(cbm_store_t *store, const char *var_name, cbm_node_t *scanned, int scan_count) {
+    cbm_iterator_t *iter = calloc(1, sizeof(cbm_iterator_t));
+    static const cbm_iterator_vtable_t vt = { .next = iter_scan_next, .free = iter_scan_free, .get_error = iter_default_get_error };
+    iter->vtable = &vt;
+    iter_scan_state_t *st = calloc(1, sizeof(iter_scan_state_t));
+    st->store = store;
+    st->var_name = var_name;
+    st->nodes = scanned; /* Takes ownership */
+    st->total = scan_count;
+    st->current = 0;
+    iter->state = st;
+    return iter;
+}
+
+/* Filter Iterator (WHERE clause) */
+static bool eval_where(const cbm_where_clause_t *w, binding_t *b); /* Forward declaration */
+
+typedef struct {
+    cbm_where_clause_t *where;
+} iter_filter_state_t;
+
+static bool iter_filter_next(cbm_iterator_t *self, binding_t *out_b) {
+    iter_filter_state_t *st = self->state;
+    while (self->child->vtable->next(self->child, out_b)) {
+        if (!st->where || eval_where(st->where, out_b)) {
+            return true;
+        }
+        binding_free(out_b);
+    }
+    return false;
+}
+
+static void iter_filter_free(cbm_iterator_t *self) {
+    if (self->child) {
+        self->child->vtable->free(self->child);
+    }
+    free(self->state);
+    free(self);
+}
+
+static cbm_iterator_t *iter_filter_new(cbm_iterator_t *child, cbm_where_clause_t *where) {
+    cbm_iterator_t *iter = calloc(1, sizeof(cbm_iterator_t));
+    static const cbm_iterator_vtable_t vt = { .next = iter_filter_next, .free = iter_filter_free, .get_error = iter_default_get_error };
+    iter->vtable = &vt;
+    iter->child = child;
+    iter_filter_state_t *st = calloc(1, sizeof(iter_filter_state_t));
+    st->where = where;
+    iter->state = st;
+    return iter;
+}
+
+/* Expand Iterator (Relationship traversal and cross joins) */
+static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_t **bindings,
+                                int *bind_count, const int *bind_cap, const char **var_name,
+                                bool is_optional);
+static int cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
+                             int extra_count, const char *nvar, bool opt, char **err);
+static int cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, binding_t **bindings,
+                                 int *bind_count, cbm_node_t *extra_nodes, int extra_count,
+                                 const char *nvar, bool opt, char **err);
+static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_rows,
+                               cbm_node_pattern_t *first, cbm_node_t **out_nodes, int *out_count);
+
+typedef struct {
+    cbm_store_t *store;
+    cbm_query_t *q;
+    int pattern_index;
+    const char *project;
+    int max_rows;
+    
+    binding_t *buffer;
+    int buf_count;
+    int buf_pos;
+    char *error;
+} iter_expand_state_t;
+
+static bool iter_expand_next(cbm_iterator_t *self, binding_t *out_b) {
+    iter_expand_state_t *st = self->state;
+    while (true) {
+        if (st->buf_pos < st->buf_count) {
+            *out_b = st->buffer[st->buf_pos++];
+            return true;
+        }
+        if (st->buffer) {
+            for (int i = 0; i < st->buf_count; i++) {
+                if (i >= st->buf_pos) binding_free(&st->buffer[i]);
+            }
+            free(st->buffer);
+            st->buffer = NULL;
+            st->buf_count = 0;
+            st->buf_pos = 0;
+        }
+        
+        binding_t child_b = {0};
+        if (!self->child->vtable->next(self->child, &child_b)) {
+            return false;
+        }
+        
+        binding_t *tmp_bindings = malloc(2 * sizeof(binding_t));
+        tmp_bindings[0] = child_b;
+        int tmp_count = 1;
+        int tmp_cap = 1;
+        
+        cbm_pattern_t *patn = &st->q->patterns[st->pattern_index];
+        bool opt = st->q->pattern_optional[st->pattern_index];
+        const char *nvar = patn->nodes[0].variable ? patn->nodes[0].variable : "_n_extra";
+        bool start_bound = binding_get(&tmp_bindings[0], nvar) != NULL;
+        bool end_bound = false;
+        if (!start_bound && patn->rel_count == 1 && patn->nodes[1].variable) {
+            end_bound = binding_get(&tmp_bindings[0], patn->nodes[1].variable) != NULL;
+        }
+        
+        char *err = NULL;
+        if (start_bound && patn->rel_count > 0) {
+            const char *tv = nvar;
+            expand_pattern_rels(st->store, patn, &tmp_bindings, &tmp_count, &tmp_cap, &tv, opt);
+        } else if (end_bound) {
+            cbm_pattern_t rev_pat = {0};
+            rev_pat.node_count = 2;
+            rev_pat.rel_count = 1;
+            rev_pat.nodes = malloc(2 * sizeof(cbm_node_pattern_t));
+            rev_pat.nodes[0] = patn->nodes[1]; 
+            rev_pat.nodes[1] = patn->nodes[0]; 
+            rev_pat.rels = malloc(1 * sizeof(cbm_rel_pattern_t));
+            rev_pat.rels[0] = patn->rels[0];
+            const char *orig_dir = patn->rels[0].direction ? patn->rels[0].direction : "outbound";
+            if (strcmp(orig_dir, "outbound") == 0) { rev_pat.rels[0].direction = "inbound"; }
+            else if (strcmp(orig_dir, "inbound") == 0) { rev_pat.rels[0].direction = "outbound"; }
+            else { rev_pat.rels[0].direction = "any"; }
+            
+            const char *tv = rev_pat.nodes[0].variable;
+            expand_pattern_rels(st->store, &rev_pat, &tmp_bindings, &tmp_count, &tmp_cap, &tv, opt);
+            free(rev_pat.nodes); free(rev_pat.rels);
+        } else {
+            cbm_node_t *extra_nodes = NULL;
+            int extra_count = 0;
+            scan_pattern_nodes(st->store, st->project, st->max_rows, &patn->nodes[0], &extra_nodes, &extra_count);
+            if (patn->rel_count == 0) {
+                if (cross_join_nodes(&tmp_bindings, &tmp_count, extra_nodes, extra_count, nvar, opt, &err) < 0) {
+                    cbm_store_free_nodes(extra_nodes, extra_count);
+                }
+            } else {
+                if (cross_join_with_rels(st->store, patn, &tmp_bindings, &tmp_count, extra_nodes, extra_count, nvar, opt, &err) < 0) {
+                    cbm_store_free_nodes(extra_nodes, extra_count);
+                }
+            }
+            cbm_store_free_nodes(extra_nodes, extra_count);
+        }
+        
+        if (err) {
+            st->error = err;
+            for(int i=0; i<tmp_count; i++) binding_free(&tmp_bindings[i]);
+            free(tmp_bindings);
+            return false;
+        }
+        
+        st->buffer = tmp_bindings;
+        st->buf_count = tmp_count;
+        st->buf_pos = 0;
+    }
+}
+
+static void iter_expand_free(cbm_iterator_t *self) {
+    iter_expand_state_t *st = self->state;
+    if (st->buffer) {
+        for (int i = st->buf_pos; i < st->buf_count; i++) {
+            binding_free(&st->buffer[i]);
+        }
+        free(st->buffer);
+    }
+    if (st->error) free(st->error);
+    if (self->child) self->child->vtable->free(self->child);
+    free(st);
+    free(self);
+}
+
+static const char *iter_expand_error(cbm_iterator_t *self) {
+    iter_expand_state_t *st = self->state;
+    if (st->error) return st->error;
+    return iter_default_get_error(self);
+}
+
+static cbm_iterator_t *iter_expand_new(cbm_iterator_t *child, cbm_store_t *store, cbm_query_t *q, int pi, const char *project, int max_rows) {
+    cbm_iterator_t *iter = calloc(1, sizeof(cbm_iterator_t));
+    static const cbm_iterator_vtable_t vt = { .next = iter_expand_next, .free = iter_expand_free, .get_error = iter_expand_error };
+    iter->vtable = &vt;
+    iter->child = child;
+    iter_expand_state_t *st = calloc(1, sizeof(iter_expand_state_t));
+    st->store = store; st->q = q; st->pattern_index = pi; st->project = project; st->max_rows = max_rows;
+    iter->state = st;
+    return iter;
+}
+
 /* Return a string field from a node by property name.  NULL-safe. */
 static const char *node_string_field(const cbm_node_t *n, const char *prop) {
     static const struct {
@@ -4071,8 +4371,15 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
 }
 
 /* Cross-join node-only pattern into existing bindings */
-static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
-                             int extra_count, const char *nvar, bool opt) {
+static int cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
+                             int extra_count, const char *nvar, bool opt, char **err) {
+    long long expected = (long long)*bind_count * extra_count;
+    if (expected > 1000000) {
+        if (err) {
+            *err = heap_strdup("Query aborted: Cartesian product exceeds memory safety limits (1M bindings). Use narrower filters.");
+        }
+        return -1;
+    }
     binding_t *new_bindings = malloc(((*bind_count * extra_count) + SKIP_ONE) * sizeof(binding_t));
     int new_count = 0;
     for (int bi = 0; bi < *bind_count; bi++) {
@@ -4094,12 +4401,20 @@ static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *
     free(*bindings);
     *bindings = new_bindings;
     *bind_count = new_count;
+    return 0;
 }
 
 /* Cross-join pattern-with-rels into existing bindings */
-static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, binding_t **bindings,
+static int cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, binding_t **bindings,
                                  int *bind_count, cbm_node_t *extra_nodes, int extra_count,
-                                 const char *nvar, bool opt) {
+                                 const char *nvar, bool opt, char **err) {
+    long long expected = (long long)*bind_count * extra_count;
+    if (expected > 100000) {
+        if (err) {
+            *err = heap_strdup("Query aborted: Cartesian product exceeds memory safety limits (100k bindings). Use narrower filters or avoid unconnected OPTIONAL MATCH.");
+        }
+        return -1;
+    }
     binding_t *new_bindings =
         malloc(((*bind_count * extra_count * CYP_GROWTH_10) + SKIP_ONE) * sizeof(binding_t));
     int new_count = 0;
@@ -4131,35 +4446,7 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
     free(*bindings);
     *bindings = new_bindings;
     *bind_count = new_count;
-}
-
-/* Expand additional MATCH patterns (pi >= 1) */
-static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const char *project,
-                                       int max_rows, binding_t **bindings, int *bind_count,
-                                       int *bind_cap) {
-    for (int pi = SKIP_ONE; pi < q->pattern_count; pi++) {
-        cbm_pattern_t *patn = &q->patterns[pi];
-        bool opt = q->pattern_optional[pi];
-        const char *nvar = patn->nodes[0].variable ? patn->nodes[0].variable : "_n_extra";
-        bool start_bound = *bind_count > 0 && binding_get(&(*bindings)[0], nvar) != NULL;
-
-        if (start_bound && patn->rel_count > 0) {
-            const char *tv = nvar;
-            expand_pattern_rels(store, patn, bindings, bind_count, bind_cap, &tv, opt);
-        } else {
-            cbm_node_t *extra_nodes = NULL;
-            int extra_count = 0;
-            scan_pattern_nodes(store, project, max_rows, &patn->nodes[0], &extra_nodes,
-                               &extra_count);
-            if (patn->rel_count == 0) {
-                cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt);
-            } else {
-                cross_join_with_rels(store, patn, bindings, bind_count, extra_nodes, extra_count,
-                                     nvar, opt);
-            }
-            cbm_store_free_nodes(extra_nodes, extra_count);
-        }
-    }
+    return 0;
 }
 
 /* Project RETURN clause results */
@@ -4192,43 +4479,73 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
 }
 
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
-                          result_builder_t *rb) {
+                          result_builder_t *rb, char **err) {
     cbm_pattern_t *pat0 = &q->patterns[0];
 
     /* Step 1: Scan initial nodes */
     cbm_node_t *scanned = NULL;
     int scan_count = 0;
     scan_pattern_nodes(store, project, max_rows, &pat0->nodes[0], &scanned, &scan_count);
-
-    /* Build initial bindings with early WHERE */
-    int bind_cap = scan_count > 0 ? scan_count : SKIP_ONE;
-    binding_t *bindings = malloc((bind_cap + SKIP_ONE) * sizeof(binding_t));
-    int bind_count = 0;
     const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : "_n0";
 
-    for (int i = 0; i < scan_count && bind_count < bind_cap; i++) {
-        binding_t b = {0};
-        b.store = store;
-        binding_set(&b, var_name, &scanned[i]);
-        bool pass = !q->where || eval_where(q->where, &b);
-        if (pass) {
-            bindings[bind_count++] = b;
-        } else {
-            binding_free(&b);
+    /* Build Volcano Pipeline */
+    cbm_iterator_t *pipe = iter_scan_new(store, var_name, scanned, scan_count);
+    
+    if (q->where) {
+        pipe = iter_filter_new(pipe, q->where);
+    }
+    
+    /* Expand first pattern's relationships */
+    if (pat0->rel_count > 0) {
+        pipe = iter_expand_new(pipe, store, q, 0, project, max_rows);
+    }
+    
+    /* Expand additional patterns */
+    for (int pi = SKIP_ONE; pi < q->pattern_count; pi++) {
+        pipe = iter_expand_new(pipe, store, q, pi, project, max_rows);
+    }
+    
+    /* Late WHERE */
+    if (q->where && (pat0->rel_count > 0 || q->pattern_count > SKIP_ONE)) {
+        pipe = iter_filter_new(pipe, q->where);
+    }
+
+    /* LIMIT Push-down optimization: If no aggregation, no WITH, no ORDER BY, push limit down */
+    bool can_push_limit = (q->with_clause == NULL) && (q->ret != NULL) && (q->ret->order_by == NULL);
+    if (can_push_limit) {
+        bool has_agg = false;
+        for (int i = 0; i < q->ret->count; i++) {
+            if (is_aggregate_func(q->ret->items[i].func)) { has_agg = true; break; }
+        }
+        if (!has_agg && q->ret->limit > 0) {
+            pipe = iter_limit_new(pipe, q->ret->skip, q->ret->limit);
         }
     }
 
-    /* Step 2: Expand first pattern's relationships */
-    expand_pattern_rels(store, pat0, &bindings, &bind_count, &bind_cap, &var_name,
-                        q->pattern_optional[0]);
+    /* Collect all streamed bindings into the old materialization array for WITH/RETURN */
+    int bind_cap = scan_count > 0 ? scan_count : SKIP_ONE;
+    if (bind_cap < 16) bind_cap = 16;
+    binding_t *bindings = malloc(bind_cap * sizeof(binding_t));
+    int bind_count = 0;
+    binding_t b = {0};
 
-    /* Step 2b: Additional patterns */
-    expand_additional_patterns(store, q, project, max_rows, &bindings, &bind_count, &bind_cap);
-
-    /* Step 3: Late WHERE */
-    if (q->where && (pat0->rel_count > 0 || q->pattern_count > SKIP_ONE)) {
-        filter_bindings_where(q->where, bindings, &bind_count);
+    while (pipe->vtable->next(pipe, &b)) {
+        if (bind_count >= bind_cap) {
+            bind_cap = bind_cap * PAIR_LEN;
+            bindings = safe_realloc(bindings, bind_cap * sizeof(binding_t));
+        }
+        bindings[bind_count++] = b;
     }
+
+    const char *pipe_err = pipe->vtable->get_error(pipe);
+    if (pipe_err) {
+        if (err) { *err = heap_strdup(pipe_err); }
+        for (int bi = 0; bi < bind_count; bi++) binding_free(&bindings[bi]);
+        free(bindings);
+        pipe->vtable->free(pipe);
+        return -1;
+    }
+    pipe->vtable->free(pipe);
 
     /* Step 3b: WITH clause */
     execute_with_clause(q, &bindings, &bind_count);
@@ -4245,7 +4562,6 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
         binding_free(&bindings[bi]);
     }
     free(bindings);
-    cbm_store_free_nodes(scanned, scan_count);
     return 0;
 }
 
@@ -4267,7 +4583,8 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
 
     result_builder_t rb = {0};
     // cppcheck-suppress knownConditionTrueFalse
-    if (execute_single(store, q, project, max_rows, &rb) < 0) {
+    if (execute_single(store, q, project, max_rows, &rb, &err) < 0) {
+        if (err) { out->error = err; }
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
@@ -4277,7 +4594,8 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     while (uq) {
         result_builder_t rb2 = {0};
         // cppcheck-suppress knownConditionTrueFalse
-        if (execute_single(store, uq, project, max_rows, &rb2) < 0) {
+        if (execute_single(store, uq, project, max_rows, &rb2, &err) < 0) {
+            if (err) { out->error = err; }
             rb_free(&rb);
             rb_free(&rb2);
             cbm_query_free(q);
