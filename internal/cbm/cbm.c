@@ -21,6 +21,7 @@
 #include "sqlite3.h" // sqlite3_mem_methods, sqlite3_config, SQLITE_CONFIG_MALLOC — bind sqlite to mimalloc
 #if defined(HAVE_LIBGIT2)
 #include <git2.h> // git_allocator, git_libgit2_opts, GIT_OPT_SET_ALLOCATOR — bind libgit2 to mimalloc
+#include <git2/sys/alloc.h>
 #endif
 #endif
 #include <stdint.h> // uint32_t, uint64_t, int64_t
