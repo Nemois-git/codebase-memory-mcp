@@ -12,6 +12,7 @@
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
 #include "git/git_context.h"
+#include "foundation/dump_verify.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -269,6 +270,75 @@ TEST(pipeline_structure_nodes) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_test_repo();
+    PASS();
+}
+
+/* Issue #516: an ADR stored via manage_adr (project_summaries) must survive a
+ * full re-index. A full re-index deletes the DB and rebuilds it from the graph
+ * buffer, which writes an empty project_summaries table; the fix captures the
+ * ADR before the delete and restores it after the rebuild. Reproduce-first:
+ * index, store an ADR, force a full re-index by adding files, assert the ADR
+ * is still present and unchanged. */
+TEST(pipeline_adr_survives_full_reindex) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+
+    /* Initial index with a single source file. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.py", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    const char *project = cbm_pipeline_project_name(p1);
+    char project_copy[256];
+    snprintf(project_copy, sizeof(project_copy), "%s", project);
+    cbm_pipeline_free(p1);
+
+    /* Store an ADR. */
+    const char *adr_text = "# Decision\nWe chose X over Y.";
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+    ASSERT_EQ(cbm_store_adr_store(s1, project_copy, adr_text), CBM_STORE_OK);
+    cbm_store_close(s1);
+
+    /* Force a full re-index: add enough files to exceed the incremental
+     * threshold so the DB is deleted and rebuilt. */
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof(path), "%s/extra%d.py", tmp, i);
+        f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "def g%d():\n    return %d\n", i, i);
+        fclose(f);
+    }
+
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_pipeline_free(p2);
+
+    /* The ADR must still be present and unchanged. */
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    cbm_adr_t adr = {0};
+    int rc = cbm_store_adr_get(s2, project_copy, &adr);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, adr_text);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s2);
+
+    rm_rf(tmp);
     PASS();
 }
 
@@ -739,6 +809,100 @@ TEST(pipeline_calls_resolution) {
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+/* True iff a CALLS edge exists from a node named src_name to a node named
+ * tgt_name. Used to assert cross-file call resolution survives a reindex. */
+static bool cross_file_call_exists(cbm_store_t *s, const char *project, const char *src_name,
+                                   const char *tgt_name) {
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, tgt_name, &tgts, &tc);
+    bool found = false;
+    for (int i = 0; i < sc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec && !found; j++) {
+            for (int k = 0; k < tc; k++) {
+                if (edges[j].target_id == tgts[k].id) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return found;
+}
+
+/* Regression: incremental re-index of an edited file must NOT drop inbound
+ * cross-file CALLS edges whose source lives in an UNCHANGED file.
+ *
+ * Repro: Serve() (pkg/service.go) CALLS Help() (pkg/util/helper.go). Editing
+ * helper.go purges Help's node; before the fix the cascade deleted the
+ * Serve->Help edge and never regenerated it (helper.go's callers are not
+ * re-parsed), so the edge silently vanished on every edit and the incremental
+ * graph diverged from a full reindex. */
+TEST(pipeline_incremental_preserves_cross_file_calls) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_incr_calls.db", g_tmpdir);
+
+    /* 1. Full index. */
+    cbm_pipeline_t *p1 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    const char *project = cbm_pipeline_project_name(p1);
+
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+    int calls_before = cbm_store_count_edges_by_type(s1, project, "CALLS");
+    ASSERT_GTE(calls_before, 2); /* main->Serve and Serve->Help at minimum */
+    ASSERT_TRUE(cross_file_call_exists(s1, project, "Serve", "Help"));
+    cbm_store_close(s1);
+    cbm_pipeline_free(p1);
+
+    /* 2. Edit the callee's file so the incremental classifier marks it changed
+     *    (mtime+size differ). Help's symbol + qualified name are unchanged. */
+    char helper[512];
+    snprintf(helper, sizeof(helper), "%s/pkg/util/helper.go", g_tmpdir);
+    ASSERT_EQ(th_append_file(helper, "\n// incremental regression marker\n"), 0);
+
+    /* 3. Re-run on the SAME db_path → auto-routes to incremental re-index. */
+    cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+
+    /* 4. The inbound cross-file CALLS edge must survive and the total CALLS
+     *    count must not regress. (Before the fix: Serve->Help is dropped.)
+     *    NOTE: query with p2's project name — p1 (and the `project` pointer it
+     *    owned) was freed above; p1 and p2 derive the same name from g_tmpdir. */
+    const char *project2 = cbm_pipeline_project_name(p2);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    int calls_after = cbm_store_count_edges_by_type(s2, project2, "CALLS");
+    ASSERT_EQ(calls_after, calls_before);
+    ASSERT_TRUE(cross_file_call_exists(s2, project2, "Serve", "Help"));
+    cbm_store_close(s2);
+    cbm_pipeline_free(p2);
+
     teardown_test_repo();
     PASS();
 }
@@ -1267,6 +1431,63 @@ TEST(usages_no_duplicate_calls) {
     }
     if (usage_edges)
         cbm_store_free_edges(usage_edges, usage_count);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_usages_repo();
+    PASS();
+}
+
+TEST(calls_edge_carries_call_site_line) {
+    /* Regression guard for #503: a CALLS edge must persist the source line of
+     * the call site in its JSON props as "line":N. Helper() is invoked on
+     * line 8 (1-based) of the source below. */
+    const char *go_source = "package mypkg\n"
+                            "\n"
+                            "func Helper() string {\n"
+                            "\treturn \"ok\"\n"
+                            "}\n"
+                            "\n"
+                            "func Main() {\n"
+                            "\tHelper()\n"
+                            "}\n";
+
+    if (setup_usages_repo("mypkg/main.go", go_source, "go.mod", "module testmod\ngo 1.21\n") != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_call_line.db", g_usages_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_edge_t *call_edges = NULL;
+    int call_count = 0;
+    cbm_store_find_edges_by_type(s, project, "CALLS", &call_edges, &call_count);
+
+    bool found_line = false;
+    for (int i = 0; i < call_count; i++) {
+        cbm_node_t src = {0}, tgt = {0};
+        if (cbm_store_find_node_by_id(s, call_edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, call_edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            if (strcmp(src.name, "Main") == 0 && strcmp(tgt.name, "Helper") == 0) {
+                ASSERT_NOT_NULL(call_edges[i].properties_json);
+                ASSERT_TRUE(strstr(call_edges[i].properties_json, "\"line\":8}") != NULL);
+                found_line = true;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (call_edges)
+        cbm_store_free_edges(call_edges, call_count);
+    ASSERT_TRUE(found_line);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -5879,6 +6100,48 @@ TEST(pipeline_complexity_transitive_loop_depth) {
     PASS();
 }
 
+/* Regression for #334: the plausibility gate compares committed (extracted)
+ * node count against persisted rows. committed_nodes must be captured BEFORE
+ * cbm_gbuf_dump_to_sqlite frees the gbuf node index — otherwise it reads 0 and
+ * the gate is silently inert. Drives the real pipeline (not a synthetic count)
+ * and asserts committed_nodes is populated and matches what was persisted. */
+TEST(pipeline_committed_counts_match_persisted) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/committed_test.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    int committed_nodes = -1;
+    int committed_edges = -1;
+    cbm_pipeline_get_committed_counts(p, &committed_nodes, &committed_edges);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    int persisted_nodes = cbm_store_count_nodes(s, project);
+    cbm_store_close(s);
+
+    /* The bug captured committed_nodes after the node index was freed → 0. */
+    ASSERT_GT(committed_nodes, 0);
+    /* A faithful full dump persists exactly what it committed. */
+    ASSERT_EQ(committed_nodes, persisted_nodes);
+    /* The gate must NOT flag a healthy full index as degraded. */
+    ASSERT_FALSE(cbm_dump_verify_is_degraded(committed_nodes, persisted_nodes,
+                                             CBM_DUMP_VERIFY_DEFAULT_RATIO,
+                                             CBM_DUMP_VERIFY_MIN_FLOOR));
+
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -5897,6 +6160,8 @@ SUITE(pipeline) {
     RUN_TEST(store_bulk_persistence);
     /* Integration: structure pass */
     RUN_TEST(pipeline_structure_nodes);
+    RUN_TEST(pipeline_committed_counts_match_persisted);
+    RUN_TEST(pipeline_adr_survives_full_reindex);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);
@@ -5911,6 +6176,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
+    RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     /* Git history pass */
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);
@@ -5926,6 +6192,7 @@ SUITE(pipeline) {
     /* Usages pass (full pipeline integration) */
     RUN_TEST(usages_creates_edges);
     RUN_TEST(usages_no_duplicate_calls);
+    RUN_TEST(calls_edge_carries_call_site_line);
     RUN_TEST(usages_kotlin_creates_edges);
     RUN_TEST(usages_kotlin_no_duplicate_calls);
     /* Language integration tests */
