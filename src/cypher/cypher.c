@@ -8,6 +8,8 @@
 #include "cypher/cypher.h"
 #include "store/store.h"
 #include "foundation/platform.h"
+#include "foundation/limits.h"
+#include "foundation/log.h"
 
 enum {
     CYP_BUF_16 = 16,
@@ -22,7 +24,6 @@ enum {
     CYP_MAX_VARS = 16,     /* max Cypher variables in a query */
     CYP_MAX_EDGE_VARS = 8, /* max edge variables */
     CYP_GROWTH_10 = 10,    /* binding growth factor */
-    CYP_MAX_DEPTH = 10,    /* max variable-length path depth */
     CYP_CHAR_IDX1 = 1,     /* second character index (e.g. op[1]) */
     CYP_EBUF_MASK = 7,
     CYP_NODE_COLS = 4, /* columns per node var: name, qn, label, file */
@@ -1615,6 +1616,10 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
     }
 
     cbm_return_clause_t *r = calloc(CBM_ALLOC_ONE, sizeof(cbm_return_clause_t));
+    /* -1 = no LIMIT clause (return all). An explicit `LIMIT 0` parses to 0 below
+     * and must return 0 rows — distinguishing the two requires a sentinel, since
+     * calloc zeroes limit and `limit > 0` would treat LIMIT 0 as "no limit". */
+    r->limit = -1;
     int cap = CYP_INIT_CAP8;
     r->items = malloc(cap * sizeof(cbm_return_item_t));
 
@@ -1646,6 +1651,16 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
         r->items[r->count++] = item;
 
     } while (check(p, TOK_COMMA));
+
+    /* Projection is materialized per row into fixed-width stack arrays sized at
+     * CBM_SZ_32 columns (execute_return_simple and its siblings). Bound the
+     * parsed item count to that width so an over-wide RETURN is rejected here
+     * instead of writing past those arrays downstream. */
+    if (r->count > CBM_SZ_32) {
+        free(r->items);
+        free(r);
+        return CBM_NOT_FOUND;
+    }
 
 tail:
     /* Optional ORDER BY */
@@ -2737,11 +2752,11 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
 
     /* IS NULL / IS NOT NULL */
     if (strcmp(c->op, "IS NULL") == 0) {
-        result = (!actual || actual[0] == '\0');
+        result = (actual[0] == '\0');
         return c->negated ? !result : result;
     }
     if (strcmp(c->op, "IS NOT NULL") == 0) {
-        result = (actual && actual[0] != '\0');
+        result = (actual[0] != '\0');
         return c->negated ? !result : result;
     }
 
@@ -3141,8 +3156,18 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
                           const cbm_node_pattern_t *target_node, binding_t *b, const char *to_var,
                           const char *rel_var, binding_t *new_bindings, int *new_count, int max_new,
                           int *match_count) {
+    /* When the terminal node variable is ALREADY bound (e.g. the second pattern
+     * `(c)-[:CALLS]->(f)` where `f` came from an earlier MATCH), we must FILTER
+     * to edges that actually reach the bound node — not overwrite the caller's
+     * `f` binding with whatever node the edge leads to. Overwriting corrupted
+     * the result of dead-code queries and produced wrong rows (#627). */
+    cbm_node_t *bound_to = binding_get(b, to_var);
+    int64_t bound_to_id = bound_to ? bound_to->id : 0;
     for (int ei = 0; ei < edge_count && *new_count < max_new; ei++) {
         int64_t tid = inbound ? edges[ei].source_id : edges[ei].target_id;
+        if (bound_to && tid != bound_to_id) {
+            continue; /* edge does not reach the already-bound terminal node */
+        }
         cbm_node_t found = {0};
         if (cbm_store_find_node_by_id(store, tid, &found) != CBM_STORE_OK) {
             continue;
@@ -3172,7 +3197,20 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                               cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
                               const char *to_var, binding_t *new_bindings, int *new_count,
                               int max_new, int *match_count) {
-    int max_depth = rel->max_hops > 0 ? rel->max_hops : CYP_MAX_DEPTH;
+    /* Clamp BOTH the explicit (`*1..N`) and unbounded (`*`, `*..m`) forms to the
+     * engine ceiling: an explicit N above the cap was previously honoured
+     * verbatim, driving cbm_store_bfs to an unbounded hop count (#887). WARN on
+     * clamp — never a silent truncation. */
+    int depth_cap = cbm_cypher_max_depth();
+    int max_depth = rel->max_hops > 0 ? rel->max_hops : depth_cap;
+    if (max_depth > depth_cap) {
+        char req_buf[16];
+        char cap_buf[16];
+        snprintf(req_buf, sizeof(req_buf), "%d", max_depth);
+        snprintf(cap_buf, sizeof(cap_buf), "%d", depth_cap);
+        cbm_log_warn("cypher.depth_capped", "requested", req_buf, "cap", cap_buf);
+        max_depth = depth_cap;
+    }
     cbm_traverse_result_t tr = {0};
     const char *dir = rel->direction ? rel->direction : "outbound";
     cbm_store_bfs(store, src->id, dir, rel->types, rel->type_count, max_depth, CBM_PERCENT, &tr);
@@ -3263,8 +3301,11 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
 
         bool is_variable_length = (rel->min_hops != SKIP_ONE || rel->max_hops != SKIP_ONE);
 
-        binding_t *new_bindings =
-            malloc(((*bind_cap * CYP_GROWTH_10) + SKIP_ONE) * sizeof(binding_t));
+        size_t alloc_n = (size_t)*bind_cap * (size_t)CYP_GROWTH_10 + SKIP_ONE;
+        binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+        if (!new_bindings) {
+            return; /* OOM: leave existing bindings untouched rather than corrupt */
+        }
         int new_count = 0;
 
         for (int bi = 0; bi < *bind_count; bi++) {
@@ -3392,7 +3433,7 @@ static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit) {
         rb->row_count = 0;
     }
     /* Limit */
-    if (limit > 0 && rb->row_count > limit) {
+    if (limit >= 0 && rb->row_count > limit) {
         for (int i = limit; i < rb->row_count; i++) {
             for (int c = 0; c < rb->col_count; c++) {
                 safe_str_free(&rb->rows[i][c]);
@@ -3706,7 +3747,7 @@ static void bindings_skip_limit(binding_t *vbindings, int *count, int skip, int 
         }
         *count = 0;
     }
-    if (limit > 0 && *count > limit) {
+    if (limit >= 0 && *count > limit) {
         for (int i = limit; i < *count; i++) {
             binding_free(&vbindings[i]);
         }
@@ -4374,7 +4415,7 @@ static void build_return_columns(result_builder_t *rb, cbm_return_clause_t *ret)
 static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings, int bind_count,
                                   int max_rows, result_builder_t *rb) {
     int proj_cap = max_rows;
-    if (ret->limit > 0 && !ret->order_by && ret->skip <= 0) {
+    if (ret->limit > 0 && !ret->distinct && !ret->order_by && ret->skip <= 0) {
         proj_cap = ret->limit;
     }
     for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
@@ -4476,8 +4517,18 @@ static int cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, binding
         }
         return -1;
     }
-    binding_t *new_bindings =
-        malloc(((*bind_count * extra_count * CYP_GROWTH_10) + SKIP_ONE) * sizeof(binding_t));
+    /* size_t arithmetic: bind_count * extra_count can exceed INT_MAX on large
+     * graphs (e.g. an unbound `c` scanned against ~29 K `f` bindings), wrapping
+     * the int product negative and yielding a tiny/garbage malloc → heap OOB
+     * write → SIGSEGV/SIGABRT (#627). */
+    size_t alloc_n = (size_t)*bind_count * (size_t)extra_count * (size_t)CYP_GROWTH_10 + SKIP_ONE;
+    binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+    if (!new_bindings) {
+        if (err) {
+            *err = heap_strdup("Query aborted: Out of memory during Cartesian product.");
+        }
+        return -1;
+    }
     int new_count = 0;
     for (int bi = 0; bi < *bind_count; bi++) {
         for (int ni = 0; ni < extra_count; ni++) {
@@ -4532,11 +4583,11 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
         }
     }
 
-    rb_apply_order_by(rb, ret);
-    rb_apply_skip_limit(rb, ret->skip, ret->limit > 0 ? ret->limit : max_rows);
     if (ret->distinct) {
         rb_apply_distinct(rb);
     }
+    rb_apply_order_by(rb, ret);
+    rb_apply_skip_limit(rb, ret->skip, ret->limit >= 0 ? ret->limit : max_rows);
 }
 
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
