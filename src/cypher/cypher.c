@@ -2375,7 +2375,7 @@ static cbm_iterator_t *iter_filter_new(cbm_iterator_t *child, cbm_where_clause_t
 
 /* Expand Iterator (Relationship traversal and cross joins) */
 static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_t **bindings,
-                                int *bind_count, const int *bind_cap, const char **var_name,
+                                int *bind_count, int *bind_cap, const char **var_name,
                                 bool is_optional);
 static int cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
                              int extra_count, const char *nvar, bool opt, char **err);
@@ -3372,8 +3372,9 @@ static void scan_alternation_labels(cbm_store_t *store, const char *project, con
     free(copy);
 }
 
-static void scan_pattern_nodes(cbm_store_t *store, const char *project, cbm_node_pattern_t *first,
-                               cbm_node_t **out_nodes, int *out_count) {
+static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_rows,
+                               cbm_node_pattern_t *first, cbm_node_t **out_nodes, int *out_count) {
+    (void)max_rows;
     if (first->label && strchr(first->label, '|')) {
         scan_alternation_labels(store, project, first->label, out_nodes, out_count);
     } else if (first->label) {
@@ -5018,7 +5019,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     }
 
     /* LIMIT Push-down optimization: If no aggregation, no WITH, no ORDER BY, push limit down */
-    bool can_push_limit = (q->with_clause == NULL) && (q->ret != NULL) && (q->ret->order_by == NULL);
+    bool can_push_limit = (q->with_clause == NULL) && (q->ret != NULL) && (q->ret->order_key_count == 0);
     if (can_push_limit) {
         bool has_agg = false;
         for (int i = 0; i < q->ret->count; i++) {
