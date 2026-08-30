@@ -6,7 +6,7 @@
 #
 # Stages and serves a complete Windows release fixture from a profile-rooted
 # directory. MSYS2 /tmp and the shared runner workspace are intentionally not
-# valid launcher bundle roots.
+# valid install roots.
 #
 # Run inside the VM's CLANGARM64 shell from the repo root:
 #   bash test-infrastructure/vm/vm-smoke.sh
@@ -19,7 +19,7 @@ Usage: [env] bash test-infrastructure/vm/vm-smoke.sh
 
 The canonical WINDOWS smoke entry: identical in local CI (win.sh
 smoke-install), PR CI (pr.yml) and the release venues (_smoke.yml). Stages a
-complete launcher+payload release fixture under a disposable profile root,
+complete single-binary release fixture under a disposable profile root,
 serves it on a kernel-assigned port, prepares/verifies/cleans the user-PATH
 registry via windows-user-path-guard.ps1, neutralizes every agent-config
 destination override, then runs scripts/smoke-test.sh (all phases).
@@ -28,16 +28,15 @@ Run inside the VM's CLANGARM64 shell (or a CI msys2 shell) from the repo root.
 
 Environment:
   SMOKE_ARCH      arm64 (default) | amd64 — selects the served artifact name.
-  SMOKE_VARIANT   standard (default) | ui. ui requires the embedded UI:
                   Phase 15's "no assets" SKIP becomes a FAILURE, so a standard
                   binary cannot pass a ui run.
   CBM_SMOKE_ARTIFACT_DIR
                   Release mode: an EXTRACTED windows release artifact
-                  (codebase-memory-mcp.exe + .payload.exe + LICENSE +
-                  install.ps1 + THIRD_PARTY_NOTICES.md). All five are required
-                  and served verbatim — an incomplete archive fails the smoke.
-                  Unset (default): stages the freshly built launcher/payload
-                  out of build/c and synthesizes the sidecars (local/PR mode).
+                  (codebase-memory-mcp.exe + LICENSE + install.ps1 +
+                  THIRD_PARTY_NOTICES.md). All four are required and served
+                  verbatim — an incomplete archive fails the smoke.
+                  Unset (default): stages the freshly built binary out of
+                  build/c and synthesizes the sidecars (local/PR mode).
 
 On failure the smoke root is preserved for post-mortem (path printed).
 EOF
@@ -51,44 +50,35 @@ cd "$(dirname "$0")/../.."
 ROOT="$PWD"
 
 # Two staging sources, one smoke. Unset (the local + PR default): stage the
-# freshly built launcher/payload out of build/c and synthesize the release
-# sidecars. Set: stage an EXTRACTED release artifact verbatim, so the release
+# freshly built binary out of build/c and synthesize the release sidecars. Set: stage an EXTRACTED release artifact verbatim, so the release
 # venue smokes the bytes it is about to publish rather than a local rebuild of
 # them. Requiring the sidecars here also makes an incomplete archive a smoke
 # failure instead of a discovery made after publishing.
 ARTIFACT_DIR="${CBM_SMOKE_ARTIFACT_DIR:-}"
 if [ -n "$ARTIFACT_DIR" ]; then
     ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
-    for required in codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
+    for required in codebase-memory-mcp.exe \
         LICENSE install.ps1 THIRD_PARTY_NOTICES.md; do
         [ -s "$ARTIFACT_DIR/$required" ] ||
             { echo "vm-smoke: release artifact is missing $required" >&2; exit 2; }
     done
-    LAUNCHER_SRC="$ARTIFACT_DIR/codebase-memory-mcp.exe"
-    PAYLOAD_SRC="$ARTIFACT_DIR/codebase-memory-mcp.payload.exe"
+    BINARY_SRC="$ARTIFACT_DIR/codebase-memory-mcp.exe"
 else
-    LAUNCHER_SRC="build/c/codebase-memory-mcp-launcher.exe"
-    PAYLOAD_SRC="build/c/codebase-memory-mcp.exe"
-    for binary in "$LAUNCHER_SRC" "$PAYLOAD_SRC"; do
-        [ -x "$binary" ] || { echo "build first; missing $binary" >&2; exit 2; }
-    done
+    BINARY_SRC="build/c/codebase-memory-mcp.exe"
+    [ -x "$BINARY_SRC" ] || { echo "build first; missing $BINARY_SRC" >&2; exit 2; }
 fi
 
 SMOKE_ARCH="${SMOKE_ARCH:-arm64}"
-SMOKE_VARIANT="${SMOKE_VARIANT:-standard}"
 case "$SMOKE_ARCH" in
 arm64 | amd64) ;;
 *) echo "vm-smoke: SMOKE_ARCH must be arm64 or amd64. Please consult --help." >&2; exit 2 ;;
 esac
-# A ui run must be handed a binary that actually carries the embedded assets;
-# the suffix alone only renames the archive. SMOKE_REQUIRE_UI turns Phase 15's
-# documented "no embedded assets" SKIP into a failure, so asking for ui and
-# supplying a standard binary can no longer pass quietly.
-case "$SMOKE_VARIANT" in
-standard) SUFFIX="" ; REQUIRE_UI=0 ;;
-ui) SUFFIX="-ui" ; REQUIRE_UI=1 ;;
-*) echo "vm-smoke: SMOKE_VARIANT must be standard or ui. Please consult --help." >&2; exit 2 ;;
-esac
+# Whether the UI must be present is the CALLER's claim, not this script's:
+# scripts/ci/smoke-artifact.sh builds --with-ui and packages the real archive, so
+# it sets SMOKE_REQUIRE_UI=1 and Phase 15's "no embedded assets" SKIP becomes a
+# FAILURE there. The fast PR lane deliberately builds without the frontend to
+# skip an npm build on every product PR, so it must not assert UI presence.
+REQUIRE_UI="${SMOKE_REQUIRE_UI:-0}"
 
 PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
 SMOKE_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-vm-smoke.XXXXXX")"
@@ -149,30 +139,25 @@ MSYS2_ARG_CONV_EXCL='*' powershell.exe -NoProfile -ExecutionPolicy Bypass \
     -RunId "$PATH_RUN_ID" \
     -SnapshotPath "$(cygpath -w "$PATH_SNAPSHOT")" \
     -SmokeRoot "$(cygpath -w "$SMOKE_DIR")"
-cp "$LAUNCHER_SRC" "$SMOKE_DIR/codebase-memory-mcp.exe"
-cp "$PAYLOAD_SRC" "$SMOKE_DIR/codebase-memory-mcp.payload.exe"
-cp "$SMOKE_DIR/codebase-memory-mcp.exe" \
-    "$SMOKE_DIR/codebase-memory-mcp.payload.exe" "$FIXTURE_DIR/"
+cp "$BINARY_SRC" "$SMOKE_DIR/codebase-memory-mcp.exe"
+cp "$SMOKE_DIR/codebase-memory-mcp.exe" "$FIXTURE_DIR/"
 # The install/update phases fetch these out of the served archive, so they must
 # be the artifact's own copies whenever one was supplied — regenerating them
 # here would smoke a sidecar the release never ships.
 if [ -n "$ARTIFACT_DIR" ]; then
-    cp "$ARTIFACT_DIR/LICENSE" "$ARTIFACT_DIR/install.ps1" \
-        "$ARTIFACT_DIR/THIRD_PARTY_NOTICES.md" "$FIXTURE_DIR/"
+    cp "$ARTIFACT_DIR/LICENSE" \
+        "$ARTIFACT_DIR/install.ps1" "$ARTIFACT_DIR/THIRD_PARTY_NOTICES.md" "$FIXTURE_DIR/"
 else
     cp LICENSE install.ps1 "$FIXTURE_DIR/"
     scripts/gen-third-party-notices.sh "$FIXTURE_DIR/THIRD_PARTY_NOTICES.md"
 fi
 
-EXPECTED_ARTIFACT="codebase-memory-mcp${SUFFIX}-windows-${SMOKE_ARCH}.zip"
+# Member set + ORDER mirror scripts/package-release.sh (Windows).
+EXPECTED_ARTIFACT="codebase-memory-mcp-windows-${SMOKE_ARCH}.zip"
 (
     cd "$FIXTURE_DIR"
     zip -q "$EXPECTED_ARTIFACT" \
-        codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
-        LICENSE install.ps1 THIRD_PARTY_NOTICES.md
-    if [ -n "$SUFFIX" ]; then
-        cp "$EXPECTED_ARTIFACT" "codebase-memory-mcp-windows-${SMOKE_ARCH}.zip"
-    fi
+        codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
     sha256sum *.zip > checksums.txt
 )
 
@@ -236,6 +221,8 @@ env \
     -u CBM_TRAE_CONFIG_PATH \
     -u CBM_ROO_CONFIG_PATH \
     -u CBM_CODY_CONFIG_PATH \
+    -u OMP_PROFILE \
+    -u PI_CODING_AGENT_DIR \
     -u CBM_TEST_WINDOWS_USER_PATH_RUN_ID \
     HOME="$(cygpath -m "$SMOKE_HOME")" \
     USERPROFILE="$(cygpath -m "$SMOKE_HOME")" \

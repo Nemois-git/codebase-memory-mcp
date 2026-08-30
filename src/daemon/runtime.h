@@ -16,6 +16,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define CBM_DAEMON_SEMVER_SIZE 12U
+
 /* Detailed post-admission operation ABI. It is deliberately absent from the
  * stable endpoint HELLO: an exact executable fingerprint already selects this
  * layout, while conflicting generations must remain able to diagnose each
@@ -262,7 +264,7 @@ typedef struct {
     uint8_t client_count; /* entries in client_pids, capped at the wire limit */
     uint32_t client_pids[CBM_DAEMON_CONTROL_CLIENT_CAP];
     char build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-    char semantic_version[12];
+    char semantic_version[CBM_DAEMON_SEMVER_SIZE];
 } cbm_daemon_runtime_status_t;
 
 typedef struct {
@@ -410,5 +412,15 @@ bool cbm_daemon_runtime_client_close_finish(cbm_daemon_runtime_client_t *client,
  * that may be immediately about to enter an exchange must use the two-phase API
  * and join that worker before close_finish. */
 bool cbm_daemon_runtime_client_close(cbm_daemon_runtime_client_t *client, uint32_t timeout_ms);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1383 test seam: force peer-image verification to fail so tests can exercise
+ * the rejection-response path from the in-process harness. */
+void cbm_daemon_runtime_force_peer_image_unverified_for_testing(bool force);
+/* #1539 test seam: force the peer image to be FINGERPRINTABLE but different,
+ * i.e. the tamper case that must still be rejected after unverifiable images
+ * became admissible. */
+void cbm_daemon_runtime_force_peer_image_mismatch_for_testing(bool force);
+#endif
 
 #endif /* CBM_DAEMON_RUNTIME_H */

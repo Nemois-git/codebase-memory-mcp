@@ -653,10 +653,23 @@ static void cbm_quarantine_load(void) {
          * never freed: the set lives for the whole (short-lived worker) process.
          * The value stores the phase so cbm_index_quarantine_phase() can report
          * "crash" vs "hang"; membership (cbm_index_is_quarantined) is value != NULL. */
-        char *key = cbm_strdup(line);
         char *pval = cbm_strdup(phase);
-        if (key && pval) {
-            cbm_ht_set(set, key, (void *)pval);
+        if (!pval) {
+            continue;
+        }
+        if (cbm_ht_has(set, line)) {
+            /* Duplicate path line: reuse the stored key (the table borrows key
+             * pointers, so a fresh copy would leak on replace) and free the
+             * value it displaces. */
+            free(cbm_ht_set(set, line, (void *)pval));
+        } else {
+            char *key = cbm_strdup(line);
+            if (key) {
+                cbm_ht_set(set, key, (void *)pval);
+            } else {
+                /* Partial failure: don't leak the value copy. */
+                free(pval);
+            }
         }
     }
     (void)fclose(f);
@@ -694,6 +707,10 @@ const char *cbm_index_quarantine_phase(const char *rel_path) {
     return (const char *)cbm_ht_get(g_quarantine_set, rel_path);
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Deterministic supervisor fault injection belongs only in explicitly
+ * seam-enabled test artifacts. Ordinary release binaries must never expose a
+ * filename-selected abort or infinite loop through environment variables. */
 static void cbm_test_fault_inject(const char *rel_path) {
     if (!rel_path || !rel_path[0]) {
         return;
@@ -708,7 +725,12 @@ static void cbm_test_fault_inject(const char *rel_path) {
             /* Busy-spin: the supervisor's quiet-timeout kills + reports us. */
         }
     }
+    const char *exit_on = getenv("CBM_TEST_EXIT_ON");
+    if (exit_on && exit_on[0] && strstr(rel_path, exit_on)) {
+        exit(1); /* Nonzero exit code → CBM_PROC_EXIT_NONZERO → classified as "error" */
+    }
 }
+#endif
 
 /* Pre-parse nesting guard for pathologically nested input. tree-sitter's GLR
  * parser recurses once per nesting level inside stack_node_add_link
@@ -769,7 +791,60 @@ static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
     acc->count++;
 }
 
-static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc) {
+/* #1610: a file that does not end with a newline leaves the grammar's
+ * mandatory line terminator MISSING. That node is ZERO-WIDTH and sits at EOF.
+ *
+ * It is not a miss. The parser consumed no source for it — start_byte ==
+ * end_byte — so by construction nothing was dropped: no construct can live in
+ * a zero-byte span, and every real instruction above it parsed normally. This
+ * is a property of the grammar's terminator rule, not of the file.
+ *
+ * Flagging it made the verdict arbitrary. Grammars whose terminator token is
+ * VISIBLE (dockerfile, tcl, fish, gomod, hyprlang) reported parse_partial for
+ * a missing final newline; grammars whose terminator is HIDDEN (ini, fsharp,
+ * beancount, requirements, gitignore, sshconfig, kconfig) reported nothing for
+ * exactly the same omission, because a hidden node is invisible to
+ * ts_node_child(). Whether a user was told their file was partially parsed
+ * depended on a grammar-authoring accident.
+ *
+ * The cost was not cosmetic: a phantom parse_partial writes a
+ * "<project>::missed" shadow row, and until #1609 that row made the project
+ * fail cross-repo validation as both source and target.
+ *
+ * Deliberately narrow — ZERO-WIDTH AT EOF ONLY. A MISSING or ERROR node with
+ * WIDTH still counts even at EOF (a Makefile whose last recipe line is
+ * unterminated really does lose the recipe), and anything before EOF is
+ * untouched.
+ *
+ * #1746: the Dockerfile grammar places that zero-width missing newline before
+ * trailing horizontal whitespace rather than at raw EOF. Preserve the broad
+ * exact-EOF rule above; only extend it past spaces/tabs when the missing token
+ * is specifically a newline. */
+static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_len) {
+    if (!ts_node_is_missing(n) || source_len < 0) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(n);
+    uint32_t end = ts_node_end_byte(n);
+    if (start != end || end > (uint32_t)source_len) {
+        return false;
+    }
+    if (end == (uint32_t)source_len) {
+        return true;
+    }
+    if (!source || strcmp(ts_node_type(n), "\n") != 0) {
+        return false;
+    }
+    for (uint32_t i = end; i < (uint32_t)source_len; i++) {
+        if (source[i] != ' ' && source[i] != '\t') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, const char *source,
+                                      int source_len) {
     if (acc->count >= CBM_MAX_ERROR_REGIONS) {
         return;
     }
@@ -777,9 +852,12 @@ static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc) {
     for (uint32_t i = 0; i < k && acc->count < CBM_MAX_ERROR_REGIONS; i++) {
         TSNode c = ts_node_child(n, i);
         if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
+            if (cbm_is_eof_terminator_miss(c, source, source_len)) {
+                continue; /* absent final newline only — nothing was dropped */
+            }
             cbm_error_regions_push(acc, c); /* top-most region; do not descend */
         } else if (ts_node_has_error(c)) {
-            cbm_collect_error_regions(c, acc);
+            cbm_collect_error_regions(c, acc, source, source_len);
         }
     }
 }
@@ -1135,7 +1213,9 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     }
 
     cbm_index_mark_start(rel_path);
+#ifdef CBM_ENABLE_TEST_SEAMS
     cbm_test_fault_inject(rel_path);
+#endif
 
     // Get language spec
     const CBMLangSpec *spec = cbm_lang_spec(language);
@@ -1247,6 +1327,13 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         cbm_extract_k8s(&ctx);
     }
 
+    // dbt lineage pass: a dbt model's dependencies live in Jinja ({{ ref(...) }}),
+    // which the SQL grammar cannot read. Self-gated — SQL files only, and only
+    // those carrying a real dbt builtin call.
+    if (ctx.language == CBM_LANG_SQL) {
+        cbm_extract_dbt(&ctx);
+    }
+
     // LSP type-aware call/usage resolution (per-file). Runs in every mode;
     // refines the tree-sitter + textual-resolution graph with type info.
     uint64_t lsp_start = now_ns();
@@ -1255,7 +1342,8 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
             cbm_run_go_lsp(a, result, source, source_len, root);
         }
         if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
-            cbm_run_c_lsp(a, result, source, source_len, root, language != CBM_LANG_C);
+            cbm_run_c_lsp(a, result, source, source_len, root, language != CBM_LANG_C,
+                          CBM_SOURCE_ORIGIN_RAW);
         }
         if (language == CBM_LANG_PHP) {
             cbm_run_php_lsp(a, result, source, source_len, root);
@@ -1315,8 +1403,11 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         if (preprocessed && preprocessed->source) {
             char *expanded = preprocessed->source;
             int expanded_len = (int)strlen(expanded);
-            // Record calls count before second pass
+            // Record every site-bearing array boundary before the second pass.
+            // Numeric byte spans in `expanded` are not raw-source coordinates.
             int calls_before = result->calls.count;
+            int usages_before = result->usages.count;
+            int resolved_before = result->resolved_calls.count;
 
             // Parse expanded source with fresh tree
             TSParser *pp_parser = get_thread_parser(ts_lang, language);
@@ -1352,11 +1443,30 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                     // harmless (pipeline deduplicates by caller+callee).
                     cbm_extract_unified(&pp_ctx);
 
+                    /* Stamp parser carriers before C-LSP performs any
+                     * origin-sensitive rewrite. Numeric spans in the expanded
+                     * buffer may collide with unrelated raw-source spans. */
+                    for (int i = calls_before; i < result->calls.count; i++) {
+                        result->calls.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
+                    for (int i = usages_before; i < result->usages.count; i++) {
+                        result->usages.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
+
                     // Also run LSP on expanded source for additional type-resolved
                     // calls (language is already C/C++/CUDA — checked in enclosing
                     // block). Runs in every mode.
                     cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
-                                  language != CBM_LANG_C);
+                                  language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED);
+
+                    /* All C-LSP emitters stamp origin directly so rewrite-time
+                     * comparisons are already safe. Keep this boundary sweep as
+                     * a defensive invariant for any future emitter added to the
+                     * C resolver. */
+                    for (int i = resolved_before; i < result->resolved_calls.count; i++) {
+                        result->resolved_calls.items[i].source_origin =
+                            CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
 
                     /* #961: a def whose body braces are split across
                      * #ifdef/#else branches parses as an ERROR region on the
@@ -1370,7 +1480,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                      * already extract. */
                     if (ts_node_has_error(root)) {
                         cbm_error_regions_t raw_regs = {{0}, {0}, 0};
-                        cbm_collect_error_regions(root, &raw_regs);
+                        cbm_collect_error_regions(root, &raw_regs, source, source_len);
                         if (raw_regs.count > 0) {
                             int defs_before = result->defs.count;
                             cbm_extract_definitions(&pp_ctx);
@@ -1528,7 +1638,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         if (strcmp(ts_node_type(root), "ERROR") == 0) {
             cbm_error_regions_push(&regs, root); /* whole file unparseable */
         } else {
-            cbm_collect_error_regions(root, &regs);
+            cbm_collect_error_regions(root, &regs, source, source_len);
         }
         cbm_subtract_recovered_regions(&regs, &result->defs);
         /* #1071: don't flag a benign function-like-macro call (defined in-file)
@@ -1563,6 +1673,12 @@ void cbm_free_result(CBMFileResult *result) {
         ts_tree_delete(result->cached_tree);
         result->cached_tree = NULL;
     }
+    for (int i = 0; i < result->owned_result_count; i++) {
+        cbm_free_result(result->owned_results[i]);
+    }
+    free(result->owned_results);
+    result->owned_results = NULL;
+    result->owned_result_count = 0;
     cbm_arena_destroy(&result->arena);
     free(result);
 }
